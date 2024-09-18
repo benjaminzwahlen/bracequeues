@@ -1,0 +1,23 @@
+{
+    "name": "benjaminzwahlen/bracequeues",
+    "description": "New project for queue management",
+    "require": {
+        "php": "^8.2",
+        "php-amqplib/php-amqplib": "^3.2"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "benjaminzwahlen\\bracequeues\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Benjamin Zwahlen",
+            "email": "benzwahlen@gmail.com"
+        }
+    ],
+    "license":"MIT"
+}
