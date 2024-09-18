@@ -1,6 +1,6 @@
 <?php
 
-namespace benjaminzwahlen\bracequeues\messagequeues\backend;
+namespace benjaminzwahlen\bracequeues\messagequeues\backends;
 
 use benjaminzwahlen\bracequeues\messagequeues\tasks\TaskMessage;
 

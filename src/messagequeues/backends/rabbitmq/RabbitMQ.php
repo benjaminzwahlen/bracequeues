@@ -1,9 +1,9 @@
 <?php
 
-namespace benjaminzwahlen\bracequeues\messagequeues\backend\rabbitmq;
+namespace benjaminzwahlen\bracequeues\messagequeues\backends\rabbitmq;
 
 
-use benjaminzwahlen\bracequeues\messagequeues\backend\BackendQueueInterface;
+use benjaminzwahlen\bracequeues\messagequeues\backends\BackendQueueInterface;
 use benjaminzwahlen\bracequeues\messagequeues\tasks\TaskMessage;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
 use PhpAmqpLib\Message\AMQPMessage;
