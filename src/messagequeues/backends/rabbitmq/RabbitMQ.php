@@ -1,35 +1,40 @@
 <?php
 
-namespace benjaminzwahlen\bracequeues\messagequeues;
+namespace benjaminzwahlen\bracequeues\messagequeues\backend\rabbitmq;
 
+
+use benjaminzwahlen\bracequeues\messagequeues\backend\BackendQueueInterface;
+use benjaminzwahlen\bracequeues\messagequeues\tasks\TaskMessage;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
 use PhpAmqpLib\Message\AMQPMessage;
 
-class RabbitMQ implements MessageQueueInterface
+class RabbitMQ implements BackendQueueInterface
 {
-    public static string $host;
-    public static string $port;
-    public static string $username;
-    public static string $password;
+    public  string $host;
+    public  string $port;
+    public  string $username;
+    public  string $password;
+    public  int $retryTtlMillis;
 
-    public static bool $passive = false;
-    public static bool $durable = true;
-    public static bool $exclusive = false;
-    public static bool $autoDelete = false;
+    public  bool $passive = false;
+    public  bool $durable = true;
+    public  bool $exclusive = false;
+    public  bool $autoDelete = false;
 
 
-    public static function init($host_, $port_, $username_, $password_)
+    public function __construct($host_, $port_, $username_, $password_, $retryTtlMillis_)
     {
-        RabbitMQ::$host = $host_;
-        RabbitMQ::$port = $port_;
-        RabbitMQ::$username = $username_;
-        RabbitMQ::$password = $password_;
+        $this->host = $host_;
+        $this->port = $port_;
+        $this->username = $username_;
+        $this->password = $password_;
+        $this->retryTtlMillis = $retryTtlMillis_;
     }
 
 
-    public static function send(string $queueName, AbstractTaskMessage $data)
+    public function send(string $queueName, TaskMessage $data)
     {
-        $connection = new AMQPStreamConnection(RabbitMQ::$host, RabbitMQ::$port, RabbitMQ::$username, RabbitMQ::$password);
+        $connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
 
         $channel = $connection->channel();
         $msg = new AMQPMessage(
@@ -44,9 +49,9 @@ class RabbitMQ implements MessageQueueInterface
     }
 
 
-    public static function registerWorker(string $queueName, callable $userCallback)
+    public function registerWorker(string $queueName, callable $userCallback)
     {
-        $connection = new AMQPStreamConnection(RabbitMQ::$host, RabbitMQ::$port, RabbitMQ::$username, RabbitMQ::$password);
+        $connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
         $channel = $connection->channel();
 
         $retryQueueName = $queueName . "_retry";
@@ -61,10 +66,10 @@ class RabbitMQ implements MessageQueueInterface
         //Standard queue
         $channel->queue_declare(
             $queueName,
-            RabbitMQ::$passive,
-            RabbitMQ::$durable,
-            RabbitMQ::$exclusive,
-            RabbitMQ::$autoDelete,
+            $this->passive,
+            $this->durable,
+            $this->exclusive,
+            $this->autoDelete,
             false,
             new \PhpAmqpLib\Wire\AMQPTable([
                 'x-dead-letter-exchange' => '',
@@ -77,7 +82,7 @@ class RabbitMQ implements MessageQueueInterface
         $channel->queue_declare($retryQueueName, false, true, false, false, false, new \PhpAmqpLib\Wire\AMQPTable([
             'x-dead-letter-exchange' => '',
             'x-dead-letter-routing-key' => $queueName,
-            'x-message-ttl' => 5000
+            'x-message-ttl' => $this->retryTtlMillis
         ]));
         $channel->queue_bind($retryQueueName, $retryQueueExchangeName);
 

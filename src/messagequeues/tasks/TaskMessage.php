@@ -1,8 +1,8 @@
 <?php
 
-namespace benjaminzwahlen\bracequeues\messagequeues;
+namespace benjaminzwahlen\bracequeues\messagequeues\tasks;
 
-abstract class AbstractTaskMessage
+class TaskMessage
 {
     public string $path;
     public array $params;
