@@ -7,6 +7,7 @@ use benjaminzwahlen\bracequeues\messagequeues\backends\BackendQueueInterface;
 use benjaminzwahlen\bracequeues\messagequeues\tasks\TaskMessage;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
 use PhpAmqpLib\Message\AMQPMessage;
+use PhpAmqpLib\Wire\AMQPTable;
 
 class RabbitMQ implements BackendQueueInterface
 {
@@ -15,6 +16,7 @@ class RabbitMQ implements BackendQueueInterface
     public  string $username;
     public  string $password;
     public  int $retryTtlMillis;
+    public  int $maxRetryCount;
 
     public  bool $passive = false;
     public  bool $durable = true;
@@ -22,93 +24,113 @@ class RabbitMQ implements BackendQueueInterface
     public  bool $autoDelete = false;
 
 
-    public function __construct($host_, $port_, $username_, $password_, $retryTtlMillis_)
+    public function __construct($host_, $port_, $username_, $password_, $retryTtlMillis_, $maxRetryCount_)
     {
         $this->host = $host_;
         $this->port = $port_;
         $this->username = $username_;
         $this->password = $password_;
         $this->retryTtlMillis = $retryTtlMillis_;
+        $this->maxRetryCount = $maxRetryCount_;
     }
 
 
-    public function send(string $queueName, TaskMessage $data)
+    public function send(string $exchangeName, TaskMessage $data)
     {
         $connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
 
         $channel = $connection->channel();
         $msg = new AMQPMessage(
             serialize($data),
-            array('delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT)
+            [
+                'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT
+            ]
         );
 
-        $channel->basic_publish($msg, '', $queueName);
+        $channel->basic_publish($msg, $exchangeName);
 
         $channel->close();
         $connection->close();
     }
 
 
-    public function registerWorker(string $queueName, callable $userCallback)
+    public function registerWorker(string $exchangeName, string $queueName, callable $userCallback)
     {
         $connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
         $channel = $connection->channel();
 
-        $retryQueueName = $queueName . "_retry";
-        $queueExchangeName = $queueName . "_DLX";
-        $retryQueueExchangeName = $retryQueueName . "_DLX";
+        /**
+         * 1️⃣ Declare exchanges
+         */
+        $channel->exchange_declare($exchangeName, 'fanout', false, true, false);
+        $channel->exchange_declare($exchangeName . "_retry", 'fanout', false, true, false);
+        $channel->exchange_declare($exchangeName . "_dlx", 'fanout', false, true, false);
 
+        /**
+         * 2️⃣ Declare queues
+         */
 
-        $channel->exchange_declare($queueExchangeName, 'direct', false, true);
-        $channel->exchange_declare($retryQueueExchangeName, 'direct', false, true);
+        // Dead-letter queue
+        $channel->queue_declare($queueName . '_dlx', false, true, false, false);
+        $channel->queue_bind($queueName . '_dlx', $exchangeName . '_dlx');
 
-
-        //Standard queue
-        $channel->queue_declare(
-            $queueName,
-            $this->passive,
-            $this->durable,
-            $this->exclusive,
-            $this->autoDelete,
-            false,
-            new \PhpAmqpLib\Wire\AMQPTable([
-                'x-dead-letter-exchange' => '',
-                'x-dead-letter-routing-key' => $retryQueueName
-            ])
-        );
-        $channel->queue_bind($queueName, $queueExchangeName);
-
-        // Retry queue with TTL
-        $channel->queue_declare($retryQueueName, false, true, false, false, false, new \PhpAmqpLib\Wire\AMQPTable([
-            'x-dead-letter-exchange' => '',
-            'x-dead-letter-routing-key' => $queueName,
+        // Retry queue with 10s TTL and dead-letter to main exchange
+        $retry_args = new AMQPTable([
+            'x-dead-letter-exchange' => $exchangeName,
             'x-message-ttl' => $this->retryTtlMillis
-        ]));
-        $channel->queue_bind($retryQueueName, $retryQueueExchangeName);
+        ]);
+        $channel->queue_declare($queueName . '_retry', false, true, false, false, false, $retry_args);
+        $channel->queue_bind($queueName . '_retry', $exchangeName . '_retry');
+
+
+        // Main queue with DLX to retry exchange
+        $main_args = new AMQPTable([
+            'x-dead-letter-exchange' => $exchangeName . '_retry'
+        ]);
+        $channel->queue_declare($queueName, false, true, false, false, false, $main_args);
+        $channel->queue_bind($queueName, $exchangeName);
 
 
 
-        $localCallback = function ($msg) use ($userCallback) {
-            try {
-                $count = 0;
-                if ($msg->has("application_headers"))
-                    $count = $msg->get("application_headers")->getNativeData()["x-death"][0]["count"];
 
-                $task = unserialize($msg->getBody());
-                if (false === call_user_func($userCallback, $task)) {
-                    echo "Worker failed task. Fail countr = " . ($count + 1) . "\n";
-                    $msg->nack();
-                } else
-                    $msg->ack();
-            } catch (\Throwable $t) {
-                echo "FAILED " . $t->getMessage() . "\n";
-                $msg->nack();
+
+
+
+
+        $localCallback = function ($msg) use ($userCallback, $channel, $exchangeName) {
+
+            $headers = $msg->has('application_headers') ? $msg->get('application_headers')->getNativeData() : [];
+            $xDeath = $headers['x-death'][0]['count'] ?? 0;
+
+
+            $task = unserialize($msg->getBody());
+
+            if (false === call_user_func($userCallback, $task)) {
+                
+
+                if ($xDeath >= $this->maxRetryCount) {
+                    // Max retries → manually publish to DLX
+                    $dlxMsg = new AMQPMessage($msg->body, [
+                        'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT
+                    ]);
+                    $channel->basic_publish($dlxMsg, $exchangeName . '_dlx');
+                    $msg->ack(); // Remove from main queue
+                    echo "Worker failed task. Moving to DLX\n";
+                } else {
+                    // Reject message, DLX routes it to retry queue
+                    echo "Worker failed task. Fail countr = " . ($xDeath + 1) . "\n";
+                    $msg->delivery_info['channel']->basic_nack($msg->delivery_info['delivery_tag'], false, false);
+                }
+
+            } else {
+                //Task successfully processed.
+                $msg->ack();
             }
         };
 
         $channel->basic_consume($queueName, '', false, false, false, false, $localCallback);
 
-        while (count($channel->callbacks)) {
+        while ($channel->is_consuming()) {
             $channel->wait();
         }
 

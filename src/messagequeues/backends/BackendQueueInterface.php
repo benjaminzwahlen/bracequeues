@@ -6,7 +6,7 @@ use benjaminzwahlen\bracequeues\messagequeues\tasks\TaskMessage;
 
 interface BackendQueueInterface
 {
-    public function send(string $queueName, TaskMessage $data);
+    public function send(string $exchangeName, TaskMessage $data);
 
-    public function registerWorker(string $queueName, callable $callback);
+    public function registerWorker(string $exchangeName, string $queueName, callable $callback);
 }

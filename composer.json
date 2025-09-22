@@ -2,7 +2,7 @@
     "name": "benjaminzwahlen/bracequeues",
     "description": "New project for queue management",
     "require": {
-        "php": "^8.2",
+        "php": "^8.4",
         "php-amqplib/php-amqplib": "^3.2"
     },
     "require-dev": {
