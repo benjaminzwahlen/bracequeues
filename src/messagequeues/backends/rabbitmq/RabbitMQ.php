@@ -6,6 +6,7 @@ namespace benjaminzwahlen\bracequeues\messagequeues\backends\rabbitmq;
 use benjaminzwahlen\bracequeues\messagequeues\backends\BackendQueueInterface;
 use benjaminzwahlen\bracequeues\messagequeues\tasks\TaskMessage;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
+use PhpAmqpLib\Exception\AMQPTimeoutException;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
 
@@ -56,6 +57,9 @@ class RabbitMQ implements BackendQueueInterface
 
     public function registerWorker(string $exchangeName, string $queueName, callable $userCallback)
     {
+
+
+
         $connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
         $channel = $connection->channel();
 
@@ -106,7 +110,7 @@ class RabbitMQ implements BackendQueueInterface
             $task = unserialize($msg->getBody());
 
             if (false === call_user_func($userCallback, $task)) {
-                
+
 
                 if ($xDeath >= $this->maxRetryCount) {
                     // Max retries → manually publish to DLX
@@ -121,17 +125,26 @@ class RabbitMQ implements BackendQueueInterface
                     echo "Worker failed task. Fail countr = " . ($xDeath + 1) . "\n";
                     $msg->delivery_info['channel']->basic_nack($msg->delivery_info['delivery_tag'], false, false);
                 }
-
             } else {
                 //Task successfully processed.
                 $msg->ack();
             }
         };
 
+        pcntl_async_signals(true);
+        pcntl_signal(SIGTERM, function () use ($channel) {
+            echo "Received termination signal.\n";
+            $channel->close();
+        });
+
         $channel->basic_consume($queueName, '', false, false, false, false, $localCallback);
 
         while ($channel->is_consuming()) {
-            $channel->wait();
+            try {
+                $channel->wait(null, false, 1);
+            } catch (AMQPTimeoutException $e) {
+                // Timeout — check for signals and loop
+            }
         }
 
         $channel->close();
