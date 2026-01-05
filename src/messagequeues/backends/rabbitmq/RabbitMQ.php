@@ -55,10 +55,8 @@ class RabbitMQ implements BackendQueueInterface
     }
 
 
-    public function registerWorker(string $exchangeName, string $queueName, callable $userCallback)
+    public function registerWorker(string $exchangeName, string $queueName, callable $userCallback, int $delayMicro = 0)
     {
-
-
 
         $connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
         $channel = $connection->channel();
@@ -101,7 +99,7 @@ class RabbitMQ implements BackendQueueInterface
 
 
 
-        $localCallback = function ($msg) use ($userCallback, $channel, $exchangeName) {
+        $localCallback = function ($msg) use ($userCallback, $channel, $exchangeName, $delayMicro) {
 
             $headers = $msg->has('application_headers') ? $msg->get('application_headers')->getNativeData() : [];
             $xDeath = $headers['x-death'][0]['count'] ?? 0;
@@ -128,6 +126,9 @@ class RabbitMQ implements BackendQueueInterface
             } else {
                 //Task successfully processed.
                 $msg->ack();
+            }
+            if ($delayMicro > 0) {
+                usleep($delayMicro);
             }
         };
 
