@@ -55,7 +55,7 @@ class RabbitMQ implements BackendQueueInterface
     }
 
 
-    public function registerWorker(string $exchangeName, string $queueName, callable $userCallback, int $delayMicro = 0)
+    public function registerWorker(string $exchangeName, string $queueName, string $routingKey, callable $userCallback, int $delayMicro = 0)
     {
 
         $connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
@@ -64,9 +64,9 @@ class RabbitMQ implements BackendQueueInterface
         /**
          * 1️⃣ Declare exchanges
          */
-        $channel->exchange_declare($exchangeName, 'fanout', false, true, false);
-        $channel->exchange_declare($exchangeName . "_retry", 'fanout', false, true, false);
-        $channel->exchange_declare($exchangeName . "_dlx", 'fanout', false, true, false);
+        $channel->exchange_declare($exchangeName, 'direct', false, true, false);
+        $channel->exchange_declare($exchangeName . "_retry", 'direct', false, true, false);
+        $channel->exchange_declare($exchangeName . "_dlx", 'direct', false, true, false);
 
         /**
          * 2️⃣ Declare queues
@@ -74,23 +74,26 @@ class RabbitMQ implements BackendQueueInterface
 
         // Dead-letter queue
         $channel->queue_declare($queueName . '_dlx', false, true, false, false);
-        $channel->queue_bind($queueName . '_dlx', $exchangeName . '_dlx');
+        $channel->queue_bind($queueName . '_dlx', $exchangeName . '_dlx', $routingKey);
 
         // Retry queue with 10s TTL and dead-letter to main exchange
         $retry_args = new AMQPTable([
             'x-dead-letter-exchange' => $exchangeName,
+            'x-dead-letter-routing-key' => $routingKey,
             'x-message-ttl' => $this->retryTtlMillis
         ]);
         $channel->queue_declare($queueName . '_retry', false, true, false, false, false, $retry_args);
-        $channel->queue_bind($queueName . '_retry', $exchangeName . '_retry');
-
+        $channel->queue_bind($queueName . '_retry', $exchangeName . '_retry', $routingKey);
 
         // Main queue with DLX to retry exchange
         $main_args = new AMQPTable([
-            'x-dead-letter-exchange' => $exchangeName . '_retry'
+            'x-dead-letter-exchange' => $exchangeName . '_retry',
+            'x-dead-letter-routing-key' => $routingKey
         ]);
         $channel->queue_declare($queueName, false, true, false, false, false, $main_args);
-        $channel->queue_bind($queueName, $exchangeName);
+        $channel->queue_bind($queueName, $exchangeName, $routingKey);
+
+        $channel->basic_qos(null, 1, null);
 
 
 
@@ -98,8 +101,7 @@ class RabbitMQ implements BackendQueueInterface
 
 
 
-
-        $localCallback = function ($msg) use ($userCallback, $channel, $exchangeName, $delayMicro) {
+        $localCallback = function ($msg) use ($userCallback, $channel, $exchangeName, $routingKey, $delayMicro) {
 
             $headers = $msg->has('application_headers') ? $msg->get('application_headers')->getNativeData() : [];
             $xDeath = $headers['x-death'][0]['count'] ?? 0;
@@ -115,13 +117,13 @@ class RabbitMQ implements BackendQueueInterface
                     $dlxMsg = new AMQPMessage($msg->body, [
                         'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT
                     ]);
-                    $channel->basic_publish($dlxMsg, $exchangeName . '_dlx');
+                    $channel->basic_publish($dlxMsg, $exchangeName . '_dlx', $routingKey);
                     $msg->ack(); // Remove from main queue
                     echo "Worker failed task. Moving to DLX\n";
                 } else {
                     // Reject message, DLX routes it to retry queue
                     echo "Worker failed task. Fail countr = " . ($xDeath + 1) . "\n";
-                    $msg->delivery_info['channel']->basic_nack($msg->delivery_info['delivery_tag'], false, false);
+                    $msg->getChannel()->basic_nack($msg->delivery_info['delivery_tag'], false, false);
                 }
             } else {
                 //Task successfully processed.

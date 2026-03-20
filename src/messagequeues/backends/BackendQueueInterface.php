@@ -8,5 +8,5 @@ interface BackendQueueInterface
 {
     public function send(string $exchangeName, TaskMessage $data);
 
-    public function registerWorker(string $exchangeName, string $queueName, callable $callback, int $delayMicro = 0);
+    public function registerWorker(string $exchangeName, string $queueName, string $routingKey, callable $callback, int $delayMicro = 0);
 }
