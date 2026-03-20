@@ -25,6 +25,9 @@ class RabbitMQ implements BackendQueueInterface
     public  bool $autoDelete = false;
 
 
+    private $connection;
+    private $channel;
+
     public function __construct($host_, $port_, $username_, $password_, $retryTtlMillis_, $maxRetryCount_)
     {
         $this->host = $host_;
@@ -36,11 +39,11 @@ class RabbitMQ implements BackendQueueInterface
     }
 
 
-    public function send(string $exchangeName, TaskMessage $data)
+    public function send(string $exchangeName, string $routingKey, TaskMessage $data)
     {
-        $connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
+        $this->connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
+        $this->channel = $this->connection->channel();
 
-        $channel = $connection->channel();
         $msg = new AMQPMessage(
             serialize($data),
             [
@@ -48,33 +51,31 @@ class RabbitMQ implements BackendQueueInterface
             ]
         );
 
-        $channel->basic_publish($msg, $exchangeName);
-
-        $channel->close();
-        $connection->close();
+        $this->channel->confirm_select();
+        $this->channel->basic_publish($msg, $exchangeName, $routingKey);
+        $this->channel->wait_for_pending_acks();
     }
-
 
     public function registerWorker(string $exchangeName, string $queueName, string $routingKey, callable $userCallback, int $delayMicro = 0)
     {
 
-        $connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
-        $channel = $connection->channel();
+        $this->connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
+        $this->channel = $this->connection->channel();
 
         /**
          * 1️⃣ Declare exchanges
          */
-        $channel->exchange_declare($exchangeName, 'direct', false, true, false);
-        $channel->exchange_declare($exchangeName . "_retry", 'direct', false, true, false);
-        $channel->exchange_declare($exchangeName . "_dlx", 'direct', false, true, false);
+        $this->channel->exchange_declare($exchangeName, 'direct', false, true, false);
+        $this->channel->exchange_declare($exchangeName . "_retry", 'direct', false, true, false);
+        $this->channel->exchange_declare($exchangeName . "_dlx", 'direct', false, true, false);
 
         /**
          * 2️⃣ Declare queues
          */
 
         // Dead-letter queue
-        $channel->queue_declare($queueName . '_dlx', false, true, false, false);
-        $channel->queue_bind($queueName . '_dlx', $exchangeName . '_dlx', $routingKey);
+        $this->channel->queue_declare($queueName . '_dlx', false, true, false, false);
+        $this->channel->queue_bind($queueName . '_dlx', $exchangeName . '_dlx', $routingKey);
 
         // Retry queue with 10s TTL and dead-letter to main exchange
         $retry_args = new AMQPTable([
@@ -82,24 +83,24 @@ class RabbitMQ implements BackendQueueInterface
             'x-dead-letter-routing-key' => $routingKey,
             'x-message-ttl' => $this->retryTtlMillis
         ]);
-        $channel->queue_declare($queueName . '_retry', false, true, false, false, false, $retry_args);
-        $channel->queue_bind($queueName . '_retry', $exchangeName . '_retry', $routingKey);
+        $this->channel->queue_declare($queueName . '_retry', false, true, false, false, false, $retry_args);
+        $this->channel->queue_bind($queueName . '_retry', $exchangeName . '_retry', $routingKey);
 
         // Main queue with DLX to retry exchange
         $main_args = new AMQPTable([
             'x-dead-letter-exchange' => $exchangeName . '_retry',
             'x-dead-letter-routing-key' => $routingKey
         ]);
-        $channel->queue_declare($queueName, false, true, false, false, false, $main_args);
-        $channel->queue_bind($queueName, $exchangeName, $routingKey);
+        $this->channel->queue_declare($queueName, false, true, false, false, false, $main_args);
+        $this->channel->queue_bind($queueName, $exchangeName, $routingKey);
 
-        $channel->basic_qos(null, 1, null);
-
-
+        $this->channel->basic_qos(null, 1, null);
 
 
 
 
+
+        $channel = $this->channel; // For use in callback
 
         $localCallback = function ($msg) use ($userCallback, $channel, $exchangeName, $routingKey, $delayMicro) {
 
@@ -137,7 +138,7 @@ class RabbitMQ implements BackendQueueInterface
         pcntl_async_signals(true);
         pcntl_signal(SIGTERM, function () use ($channel) {
             echo "Received termination signal.\n";
-            $channel->close();
+            $this->close();
         });
 
         $channel->basic_consume($queueName, '', false, false, false, false, $localCallback);
@@ -150,7 +151,13 @@ class RabbitMQ implements BackendQueueInterface
             }
         }
 
-        $channel->close();
-        $connection->close();
+        $this->close();
+    }
+
+
+    public function close()
+    {
+        $this->channel->close();
+        $this->connection->close();
     }
 }
