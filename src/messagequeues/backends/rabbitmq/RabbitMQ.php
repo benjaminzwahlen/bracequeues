@@ -2,7 +2,6 @@
 
 namespace benjaminzwahlen\bracequeues\messagequeues\backends\rabbitmq;
 
-
 use benjaminzwahlen\bracequeues\messagequeues\backends\BackendQueueInterface;
 use benjaminzwahlen\bracequeues\messagequeues\tasks\TaskMessage;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
@@ -12,21 +11,20 @@ use PhpAmqpLib\Wire\AMQPTable;
 
 class RabbitMQ implements BackendQueueInterface
 {
-    public  string $host;
-    public  string $port;
-    public  string $username;
-    public  string $password;
-    public  int $retryTtlMillis;
-    public  int $maxRetryCount;
+    public string $host;
+    public string $port;
+    public string $username;
+    public string $password;
+    public int $retryTtlMillis;
+    public int $maxRetryCount;
 
-    public  bool $passive = false;
-    public  bool $durable = true;
-    public  bool $exclusive = false;
-    public  bool $autoDelete = false;
+    public bool $passive = false;
+    public bool $durable = true;
+    public bool $exclusive = false;
+    public bool $autoDelete = false;
 
-
-    private $connection;
-    private $channel;
+    private ?AMQPStreamConnection $connection = null;
+    private $channel = null;
 
     public function __construct($host_, $port_, $username_, $password_, $retryTtlMillis_, $maxRetryCount_)
     {
@@ -38,29 +36,104 @@ class RabbitMQ implements BackendQueueInterface
         $this->maxRetryCount = $maxRetryCount_;
     }
 
+    /**
+     * -------------------------
+     * CONNECTION MANAGEMENT
+     * -------------------------
+     */
+    private function connect(): void
+    {
+        $this->connection = new AMQPStreamConnection(
+            $this->host,
+            $this->port,
+            $this->username,
+            $this->password
+        );
 
+        $this->channel = $this->connection->channel();
+        $this->channel->confirm_select();
+    }
+
+    private function ensureConnection(): void
+    {
+        if (
+            $this->connection === null ||
+            !$this->connection->isConnected()
+        ) {
+            $this->connect();
+        }
+    }
+
+    private function reconnect(): void
+    {
+        try {
+            if ($this->channel) {
+                $this->channel->close();
+            }
+        } catch (\Throwable $e) {
+        }
+
+        try {
+            if ($this->connection) {
+                $this->connection->close();
+            }
+        } catch (\Throwable $e) {
+        }
+
+        $this->connection = null;
+        $this->channel = null;
+
+        $this->connect();
+    }
+
+    /**
+     * -------------------------
+     * PRODUCER
+     * -------------------------
+     */
     public function send(string $exchangeName, string $routingKey, TaskMessage $data)
     {
-        $this->connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
-        $this->channel = $this->connection->channel();
+        $this->ensureConnection();
 
         $msg = new AMQPMessage(
             serialize($data),
-            [
-                'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT
-            ]
+            ['delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT]
         );
 
-        $this->channel->confirm_select();
-        $this->channel->basic_publish($msg, $exchangeName, $routingKey);
-        $this->channel->wait_for_pending_acks();
+        try {
+            $this->channel->basic_publish($msg, $exchangeName, $routingKey);
+            $this->channel->wait_for_pending_acks();
+        } catch (\Throwable $e) {
+            // reconnect + retry once
+            $this->reconnect();
+
+            $this->channel->basic_publish($msg, $exchangeName, $routingKey);
+            $this->channel->wait_for_pending_acks();
+        }
     }
 
+    /**
+     * -------------------------
+     * WORKER
+     * -------------------------
+     */
     public function registerWorker(string $exchangeName, string $queueName, string $routingKey, callable $userCallback, int $delayMicro = 0)
     {
+        while (true) {
+            try {
+                $this->runWorker($exchangeName, $queueName, $routingKey, $userCallback, $delayMicro);
+            } catch (\Throwable $e) {
+                echo "Worker crashed, reconnecting: {$e->getMessage()}\n";
+                sleep(2); // basic backoff
+                $this->reconnect();
+                echo "Connected.\n";
+            }
+        }
+    }
 
-        $this->connection = new AMQPStreamConnection($this->host, $this->port, $this->username, $this->password);
-        $this->channel = $this->connection->channel();
+    private function runWorker(string $exchangeName, string $queueName, string $routingKey, callable $userCallback, int $delayMicro)
+    {
+        $this->ensureConnection();
 
         /**
          * 1️⃣ Declare exchanges
@@ -107,38 +180,40 @@ class RabbitMQ implements BackendQueueInterface
             $headers = $msg->has('application_headers') ? $msg->get('application_headers')->getNativeData() : [];
             $xDeath = $headers['x-death'][0]['count'] ?? 0;
 
-
             $task = unserialize($msg->getBody());
 
-            if (false === call_user_func($userCallback, $task)) {
+            try {
+                if (false === call_user_func($userCallback, $task)) {
 
-
-                if ($xDeath >= $this->maxRetryCount) {
-                    // Max retries → manually publish to DLX
-                    $dlxMsg = new AMQPMessage($msg->body, [
-                        'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT
-                    ]);
-                    $channel->basic_publish($dlxMsg, $exchangeName . '_dlx', $routingKey);
-                    $msg->ack(); // Remove from main queue
-                    echo "Worker failed task. Moving to DLX\n";
+                    if ($xDeath >= $this->maxRetryCount) {
+                        $dlxMsg = new AMQPMessage($msg->body, [
+                            'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT
+                        ]);
+                        $channel->basic_publish($dlxMsg, $exchangeName . '_dlx', $routingKey);
+                        $msg->ack();
+                        echo "Moved to DLX\n";
+                    } else {
+                        $msg->nack(false, false);
+                        echo "Retry " . ($xDeath + 1) . "\n";
+                    }
                 } else {
-                    // Reject message, DLX routes it to retry queue
-                    echo "Worker failed task. Fail countr = " . ($xDeath + 1) . "\n";
-                    $msg->getChannel()->basic_nack($msg->delivery_info['delivery_tag'], false, false);
+                    $msg->ack();
                 }
-            } else {
-                //Task successfully processed.
-                $msg->ack();
+            } catch (\Throwable $e) {
+                // fail-safe: don't lose message
+                $msg->nack(false, false);
             }
+
             if ($delayMicro > 0) {
                 usleep($delayMicro);
             }
         };
 
         pcntl_async_signals(true);
-        pcntl_signal(SIGTERM, function () use ($channel) {
-            echo "Received termination signal.\n";
+        pcntl_signal(SIGTERM, function () {
+            echo "Shutdown signal received\n";
             $this->close();
+            exit;
         });
 
         $channel->basic_consume($queueName, '', false, false, false, false, $localCallback);
@@ -147,17 +222,35 @@ class RabbitMQ implements BackendQueueInterface
             try {
                 $channel->wait(null, false, 1);
             } catch (AMQPTimeoutException $e) {
-                // Timeout — check for signals and loop
+                // keep loop alive
             }
         }
-
-        $this->close();
     }
 
-
-    public function close()
+    /**
+     * -------------------------
+     * CLEANUP
+     * -------------------------
+     */
+    public function close(): void
     {
-        $this->channel->close();
-        $this->connection->close();
+        try {
+            if ($this->channel) {
+                $this->channel->close();
+            }
+        } catch (\Throwable $e) {
+        }
+
+        try {
+            if ($this->connection) {
+                $this->connection->close();
+            }
+        } catch (\Throwable $e) {
+        }
+    }
+
+    public function __destruct()
+    {
+        $this->close();
     }
 }
